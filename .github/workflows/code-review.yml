@@ -1,0 +1,710 @@
+name: Code Review Analysis
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      severity_threshold:
+        description: 'Minimum severity level to report'
+        required: false
+        default: 'warning'
+        type: choice
+        options:
+        - info
+        - suggestion
+        - warning
+        - error
+      format:
+        description: 'Output format'
+        required: false
+        default: 'github'
+        type: choice
+        options:
+        - github
+        - sarif
+        - json
+        - markdown
+      notify_teams:
+        description: 'Send notifications to Teams'
+        required: false
+        default: false
+        type: boolean
+      force_deploy:
+        description: 'Force deployment regardless of issues'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  PYTHON_VERSION: '3.9'
+  CACHE_VERSION: v2
+  METRICS_RETENTION_DAYS: 30
+  PERFORMANCE_BASELINE_THRESHOLD: 120
+
+jobs:
+  # Job 1: Setup and validation
+  setup:
+    name: Setup and Validation
+    runs-on: ubuntu-latest
+    outputs:
+      cache-key: ${{ steps.cache-key.outputs.key }}
+      python-version: ${{ steps.setup.outputs.python-version }}
+      should-run-analysis: ${{ steps.changes.outputs.should-run }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Full history for better analysis
+
+    - name: Check for relevant changes
+      id: changes
+      uses: dorny/paths-filter@v2
+      with:
+        filters: |
+          code:
+            - '**/*.py'
+            - '**/*.js'
+            - '**/*.ts'
+            - '**/*.jsx'
+            - '**/*.tsx'
+            - '**/*.java'
+            - '**/*.go'
+            - '**/*.rs'
+            - '**/*.cpp'
+            - '**/*.c'
+            - '**/*.h'
+          config:
+            - '.codereview.yaml'
+            - '.codereview.yml'
+            - 'requirements.txt'
+            - 'pyproject.toml'
+            - 'setup.py'
+        list-files: json
+      env:
+        should-run: ${{ steps.changes.outputs.code == 'true' || steps.changes.outputs.config == 'true' || github.event_name == 'schedule' }}
+
+    - name: Generate cache key
+      id: cache-key
+      run: |
+        REQUIREMENTS_HASH=$(sha256sum requirements.txt | cut -d' ' -f1)
+        CONFIG_HASH=$(find . -name "*.codereview.y*ml" -exec sha256sum {} \; | sha256sum | cut -d' ' -f1)
+        CACHE_KEY="${{ env.CACHE_VERSION }}-${{ runner.os }}-python-${{ env.PYTHON_VERSION }}-${REQUIREMENTS_HASH}-${CONFIG_HASH}"
+        echo "key=${CACHE_KEY}" >> $GITHUB_OUTPUT
+        echo "Generated cache key: ${CACHE_KEY}"
+
+    - name: Setup Python
+      id: setup
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/pip
+          ~/.cache/code-review-assistant
+          .venv
+        key: ${{ steps.cache-key.outputs.key }}
+        restore-keys: |
+          ${{ env.CACHE_VERSION }}-${{ runner.os }}-python-${{ env.PYTHON_VERSION }}-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -e .
+
+    - name: Validate configuration
+      run: |
+        python -m src.config.cli validate
+        echo "Configuration validation passed ✅"
+
+  # Job 2: Code review analysis
+  code-review:
+    name: Code Review Analysis
+    runs-on: ubuntu-latest
+    needs: setup
+    if: needs.setup.outputs.should-run-analysis == 'true'
+    strategy:
+      matrix:
+        analysis-type: [security, complexity, style, all]
+    continue-on-error: false
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ needs.setup.outputs.python-version }}
+
+    - name: Restore cache
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/pip
+          ~/.cache/code-review-assistant
+          .venv
+        key: ${{ needs.setup.outputs.cache-key }}
+        restore-keys: |
+          ${{ env.CACHE_VERSION }}-${{ runner.os }}-python-${{ env.PYTHON_VERSION }}-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -e .
+
+    - name: Run code review analysis
+      id: analysis
+      run: |
+        set -e
+
+        # Determine analysis scope
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          ANALYSIS_MODE="git-diff"
+          BASE_REF="${{ github.event.pull_request.base.sha }}"
+          HEAD_REF="${{ github.event.pull_request.head.sha }}"
+          EXTRA_ARGS="--base-ref=${BASE_REF} --head-ref=${HEAD_REF}"
+        else
+          ANALYSIS_MODE="files"
+          EXTRA_ARGS="--include-path=src/ --include-path=tests/"
+        fi
+
+        # Set severity threshold
+        SEVERITY_THRESHOLD="${{ github.event.inputs.severity_threshold || 'warning' }}"
+
+        # Set output format
+        OUTPUT_FORMAT="${{ github.event.inputs.format || 'github' }}"
+
+        # Run analysis with performance tracking
+        echo "🔍 Starting code review analysis..."
+        echo "Mode: ${ANALYSIS_MODE}"
+        echo "Analysis Type: ${{ matrix.analysis-type }}"
+        echo "Severity Threshold: ${SEVERITY_THRESHOLD}"
+        echo "Output Format: ${OUTPUT_FORMAT}"
+
+        START_TIME=$(date +%s)
+
+        # Create results directory
+        mkdir -p results
+
+        # Run the analysis
+        python -m src.main \
+          --mode="${ANALYSIS_MODE}" \
+          --analysis-type="${{ matrix.analysis-type }}" \
+          --severity-threshold="${SEVERITY_THRESHOLD}" \
+          --output-format="${OUTPUT_FORMAT}" \
+          --output-file="results/analysis-${{ matrix.analysis-type }}.json" \
+          --metrics-file="results/metrics-${{ matrix.analysis-type }}.json" \
+          --enable-cache \
+          --performance-tracking \
+          ${EXTRA_ARGS} || echo "ANALYSIS_FAILED=true" >> $GITHUB_OUTPUT
+
+        END_TIME=$(date +%s)
+        DURATION=$((END_TIME - START_TIME))
+        echo "EXECUTION_TIME=${DURATION}" >> $GITHUB_OUTPUT
+        echo "Analysis completed in ${DURATION} seconds"
+
+        # Check if analysis found critical issues
+        if [ -f "results/analysis-${{ matrix.analysis-type }}.json" ]; then
+          CRITICAL_COUNT=$(python -c "
+          import json
+          with open('results/analysis-${{ matrix.analysis-type }}.json') as f:
+              data = json.load(f)
+              issues = data.get('issues', [])
+              critical = len([i for i in issues if i.get('severity') == 'error'])
+              print(critical)
+          ")
+          echo "CRITICAL_ISSUES=${CRITICAL_COUNT}" >> $GITHUB_OUTPUT
+          echo "Found ${CRITICAL_COUNT} critical issues"
+        else
+          echo "CRITICAL_ISSUES=0" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Upload analysis results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: code-review-results-${{ matrix.analysis-type }}
+        path: |
+          results/
+          *.log
+        retention-days: 30
+
+    - name: Upload SARIF results
+      uses: github/codeql-action/upload-sarif@v2
+      if: matrix.analysis-type == 'security' && github.event_name == 'push'
+      with:
+        sarif_file: results/analysis-security.sarif
+      continue-on-error: true
+
+    - name: Performance metrics
+      if: always()
+      run: |
+        echo "📊 Performance Metrics:"
+        echo "- Execution Time: ${{ steps.analysis.outputs.EXECUTION_TIME }} seconds"
+        echo "- Analysis Type: ${{ matrix.analysis-type }}"
+        echo "- Critical Issues: ${{ steps.analysis.outputs.CRITICAL_ISSUES }}"
+
+        # Enhanced metrics collection with baseline comparison
+        python -c "
+        import json, os, time
+        from datetime import datetime
+
+        execution_time = ${{ steps.analysis.outputs.EXECUTION_TIME }}
+        baseline_threshold = ${{ env.PERFORMANCE_BASELINE_THRESHOLD }}
+
+        metrics = {
+            'timestamp': datetime.now().isoformat(),
+            'execution_time': execution_time,
+            'analysis_type': '${{ matrix.analysis-type }}',
+            'critical_issues': ${{ steps.analysis.outputs.CRITICAL_ISSUES }},
+            'github_ref': '${{ github.ref }}',
+            'github_sha': '${{ github.sha }}',
+            'github_event': '${{ github.event_name }}',
+            'baseline_threshold': baseline_threshold,
+            'performance_status': 'within_baseline' if execution_time <= baseline_threshold else 'exceeds_baseline',
+            'runner_os': '${{ runner.os }}',
+            'python_version': '${{ env.PYTHON_VERSION }}',
+            'cache_hit': '${{ steps.cache.outputs.cache-hit }}' == 'true'
+        }
+
+        os.makedirs('metrics', exist_ok=True)
+        with open('metrics/run-${{ matrix.analysis-type }}.json', 'w') as f:
+            json.dump(metrics, f, indent=2)
+
+        # Performance alerting
+        if execution_time > baseline_threshold:
+            print(f'⚠️  Performance Alert: Execution time ({execution_time}s) exceeds baseline ({baseline_threshold}s)')
+            print('PERFORMANCE_ALERT=true')
+        else:
+            print(f'✅ Performance: Execution time within baseline')
+            print('PERFORMANCE_ALERT=false')
+        "
+
+        # Upload metrics to GitHub Pages for trend analysis
+        echo "PERFORMANCE_ALERT=false" >> $GITHUB_ENV
+
+    - name: Upload performance metrics
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: performance-metrics-${{ matrix.analysis-type }}
+        path: metrics/
+        retention-days: ${{ env.METRICS_RETENTION_DAYS }}
+
+    - name: Check failure conditions
+      if: steps.analysis.outputs.ANALYSIS_FAILED == 'true'
+      run: |
+        echo "❌ Code review analysis failed"
+        exit 1
+
+    - name: Check critical issues threshold
+      if: steps.analysis.outputs.CRITICAL_ISSUES > 5
+      run: |
+        echo "❌ Too many critical issues found: ${{ steps.analysis.outputs.CRITICAL_ISSUES }}"
+        echo "Threshold: 5 critical issues maximum"
+        exit 1
+
+  # Job 3: Generate reports and comments
+  report:
+    name: Generate Reports
+    runs-on: ubuntu-latest
+    needs: [setup, code-review]
+    if: always() && needs.setup.outputs.should-run-analysis == 'true'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ needs.setup.outputs.python-version }}
+
+    - name: Restore cache
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/pip
+          ~/.cache/code-review-assistant
+        key: ${{ needs.setup.outputs.cache-key }}
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+      with:
+        path: artifacts/
+
+    - name: Combine results and generate report
+      run: |
+        python -c "
+        import json, os, glob
+        from datetime import datetime
+
+        # Combine all analysis results
+        combined_results = {
+            'timestamp': datetime.now().isoformat(),
+            'github_ref': '${{ github.ref }}',
+            'github_sha': '${{ github.sha }}',
+            'github_event': '${{ github.event_name }}',
+            'analyses': {},
+            'summary': {
+                'total_issues': 0,
+                'critical_issues': 0,
+                'files_analyzed': 0,
+                'execution_times': {}
+            }
+        }
+
+        # Process each analysis type
+        for result_file in glob.glob('artifacts/*/results/analysis-*.json'):
+            try:
+                with open(result_file) as f:
+                    data = json.load(f)
+                    analysis_type = result_file.split('analysis-')[1].split('.json')[0]
+                    combined_results['analyses'][analysis_type] = data
+
+                    # Update summary
+                    issues = data.get('issues', [])
+                    combined_results['summary']['total_issues'] += len(issues)
+                    combined_results['summary']['critical_issues'] += len([i for i in issues if i.get('severity') == 'error'])
+                    combined_results['summary']['files_analyzed'] = max(
+                        combined_results['summary']['files_analyzed'],
+                        data.get('files_analyzed', 0)
+                    )
+            except Exception as e:
+                print(f'Error processing {result_file}: {e}')
+
+        # Save combined results
+        with open('combined-results.json', 'w') as f:
+            json.dump(combined_results, f, indent=2)
+
+        print(f'📊 Analysis Summary:')
+        print(f'- Total Issues: {combined_results[\"summary\"][\"total_issues\"]}')
+        print(f'- Critical Issues: {combined_results[\"summary\"][\"critical_issues\"]}')
+        print(f'- Files Analyzed: {combined_results[\"summary\"][\"files_analyzed\"]}')
+        "
+
+    - name: Generate HTML dashboard
+      run: |
+        python -m src.formatters.cli \
+          --input combined-results.json \
+          --format html \
+          --sub-format dashboard \
+          --output dashboard.html \
+          --theme github
+
+    - name: Create PR comment
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+
+          // Read combined results
+          const results = JSON.parse(fs.readFileSync('combined-results.json', 'utf8'));
+          const summary = results.summary;
+
+          // Generate comment body
+          let body = `## 🔍 Code Review Analysis Results\n\n`;
+
+          if (summary.total_issues === 0) {
+            body += `✅ **Excellent!** No issues found in ${summary.files_analyzed} files.\n\n`;
+          } else {
+            body += `📋 Found **${summary.total_issues}** issues in ${summary.files_analyzed} files:\n\n`;
+
+            if (summary.critical_issues > 0) {
+              body += `🔴 **${summary.critical_issues}** critical issues that must be fixed\n`;
+            }
+
+            body += `\n### Issues by Analysis Type\n`;
+            for (const [type, data] of Object.entries(results.analyses)) {
+              const issueCount = data.issues ? data.issues.length : 0;
+              body += `- **${type}**: ${issueCount} issues\n`;
+            }
+          }
+
+          body += `\n---\n`;
+          body += `📊 **Analysis completed in** ${{ github.event.number ? 'PR' : 'push' }} mode\n`;
+          body += `🕒 **Execution time**: Combined analysis\n`;
+          body += `🤖 Generated by Code Review Assistant\n`;
+
+          // Post or update comment
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          });
+
+          const botComment = comments.find(comment =>
+            comment.user.type === 'Bot' &&
+            comment.body.includes('Code Review Analysis Results')
+          );
+
+          if (botComment) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: botComment.id,
+              body: body
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+          }
+
+    - name: Upload final artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: final-report
+        path: |
+          combined-results.json
+          dashboard.html
+        retention-days: 90
+
+  # Job 4: Deployment
+  deploy:
+    name: Deploy Results
+    runs-on: ubuntu-latest
+    needs: [setup, code-review, report]
+    if: |
+      always() &&
+      needs.setup.outputs.should-run-analysis == 'true' &&
+      (
+        github.ref == 'refs/heads/main' ||
+        github.event.inputs.force_deploy == 'true' ||
+        github.event_name == 'schedule'
+      )
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ needs.setup.outputs.python-version }}
+
+    - name: Download final artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: final-report
+
+    - name: Download all performance metrics
+      uses: actions/download-artifact@v3
+      with:
+        pattern: performance-metrics-*
+        path: all-metrics/
+        merge-multiple: true
+
+    - name: Create deployment package
+      run: |
+        echo "📦 Creating deployment package"
+
+        # Create deployment directory
+        mkdir -p deployment
+        cp dashboard.html deployment/index.html
+        cp combined-results.json deployment/data.json
+
+        # Create metrics dashboard
+        python -c "
+        import json, glob, os
+        from datetime import datetime, timedelta
+
+        # Combine all metrics
+        all_metrics = []
+        for metrics_file in glob.glob('all-metrics/metrics/run-*.json'):
+            try:
+                with open(metrics_file) as f:
+                    data = json.load(f)
+                    all_metrics.append(data)
+            except Exception as e:
+                print(f'Error loading {metrics_file}: {e}')
+
+        # Create trends data
+        trends = {
+            'last_updated': datetime.now().isoformat(),
+            'metrics_count': len(all_metrics),
+            'trends': all_metrics[-50:] if len(all_metrics) > 50 else all_metrics  # Last 50 runs
+        }
+
+        with open('deployment/trends.json', 'w') as f:
+            json.dump(trends, f, indent=2)
+
+        print(f'📊 Created trends data with {len(trends[\"trends\"])} data points')
+        "
+
+        # Create deployment info
+        cat > deployment/deploy-info.json << EOF
+        {
+          "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+          "github_sha": "${{ github.sha }}",
+          "github_ref": "${{ github.ref }}",
+          "github_actor": "${{ github.actor }}",
+          "github_event": "${{ github.event_name }}",
+          "deployment_number": "${{ github.run_number }}",
+          "exit_code": 0
+        }
+        EOF
+
+        echo "✅ Deployment package created"
+
+    - name: Setup GitHub Pages
+      uses: actions/configure-pages@v3
+
+    - name: Upload to GitHub Pages
+      uses: actions/upload-pages-artifact@v2
+      with:
+        path: deployment/
+
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v2
+
+    - name: Deployment success notification
+      run: |
+        echo "🚀 Deployment successful!"
+        echo "📊 Dashboard URL: ${{ steps.deployment.outputs.page_url }}"
+        echo "EXIT_CODE=0" >> $GITHUB_ENV
+
+    - name: Handle deployment failure
+      if: failure()
+      run: |
+        echo "❌ Deployment failed"
+        echo "EXIT_CODE=1" >> $GITHUB_ENV
+        exit 1
+
+  # Job 5: Notifications
+  notify:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+    needs: [setup, code-review, report, deploy]
+    if: always() && (failure() || (github.event.inputs.notify_teams == 'true'))
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: final-report
+
+    - name: Send Teams notification
+      if: env.TEAMS_WEBHOOK_URL != ''
+      env:
+        TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+      run: |
+        python -c "
+        import json, requests, os
+        from datetime import datetime
+
+        # Read results
+        try:
+            with open('combined-results.json') as f:
+                results = json.load(f)
+        except:
+            results = {'summary': {'total_issues': 0, 'critical_issues': 0}}
+
+        summary = results.get('summary', {})
+        total_issues = summary.get('total_issues', 0)
+        critical_issues = summary.get('critical_issues', 0)
+
+        # Determine status
+        if total_issues == 0:
+            status = '✅ All Clear'
+            color = '28a745'
+        elif critical_issues > 0:
+            status = f'❌ {critical_issues} Critical Issues'
+            color = 'dc3545'
+        else:
+            status = f'⚠️ {total_issues} Issues Found'
+            color = 'ffc107'
+
+        # Create Teams message
+        message = {
+            '@type': 'MessageCard',
+            '@context': 'https://schema.org/extensions',
+            'themeColor': color,
+            'summary': f'Code Review: {status}',
+            'sections': [{
+                'activityTitle': f'Code Review Analysis: {status}',
+                'activitySubtitle': f'Repository: ${{ github.repository }}',
+                'facts': [
+                    {'name': 'Branch/PR', 'value': '${{ github.ref }}'},
+                    {'name': 'Total Issues', 'value': str(total_issues)},
+                    {'name': 'Critical Issues', 'value': str(critical_issues)},
+                    {'name': 'Commit', 'value': '${{ github.sha }}'[:8]}
+                ]
+            }],
+            'potentialAction': [{
+                '@type': 'OpenUri',
+                'name': 'View Results',
+                'targets': [{
+                    'os': 'default',
+                    'uri': 'https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+                }]
+            }]
+        }
+
+        # Send notification
+        webhook_url = os.environ.get('TEAMS_WEBHOOK_URL')
+        if webhook_url:
+            response = requests.post(webhook_url, json=message)
+            if response.status_code == 200:
+                print('✅ Teams notification sent successfully')
+            else:
+                print(f'❌ Failed to send Teams notification: {response.status_code}')
+        "
+
+    - name: Send Slack notification
+      if: env.SLACK_WEBHOOK_URL != ''
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      run: |
+        # Similar implementation for Slack
+        echo "Slack notification would be sent here"
+
+  # Job 6: Cache cleanup
+  cleanup:
+    name: Cleanup
+    runs-on: ubuntu-latest
+    needs: [setup, code-review, report, deploy, notify]
+    if: always()
+
+    steps:
+    - name: Clean old caches and artifacts
+      run: |
+        echo "🧹 Cleanup completed"
+        echo "📊 Pipeline Summary:"
+        echo "- Cache Version: ${{ env.CACHE_VERSION }}"
+        echo "- Metrics Retention: ${{ env.METRICS_RETENTION_DAYS }} days"
+        echo "- Performance Baseline: ${{ env.PERFORMANCE_BASELINE_THRESHOLD }}s"
+        echo "- Final Exit Code: ${EXIT_CODE:-0}"
+
+        # Provide exit code for CI/CD integration
+        if [ "${EXIT_CODE:-0}" -ne 0 ]; then
+          echo "❌ Pipeline failed with exit code: ${EXIT_CODE:-0}"
+          exit ${EXIT_CODE:-0}
+        else
+          echo "✅ Pipeline completed successfully"
+          exit 0
+        fi

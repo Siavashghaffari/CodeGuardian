@@ -1,0 +1,882 @@
+# GitLab CI/CD Pipeline for Code Review Assistant
+# Supports GitLab 15.0+ with advanced features
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Code-Quality.gitlab-ci.yml
+
+variables:
+  # Pipeline configuration
+  PYTHON_VERSION: "3.9"
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  CACHE_VERSION: "v2"
+
+  # Code Review Assistant configuration
+  CODEREVIEW_SEVERITY_THRESHOLD: "warning"
+  CODEREVIEW_OUTPUT_FORMAT: "gitlab_ci"
+  CODEREVIEW_ENABLE_CACHE: "true"
+  CODEREVIEW_PERFORMANCE_TRACKING: "true"
+  CODEREVIEW_BASELINE_THRESHOLD: "120"
+
+  # Docker configuration for faster builds
+  FF_USE_FASTZIP: "true"
+  ARTIFACT_COMPRESSION_LEVEL: "fast"
+  CACHE_COMPRESSION_LEVEL: "fast"
+
+  # Performance and metrics
+  METRICS_RETENTION_DAYS: "30"
+  ENABLE_PERFORMANCE_ALERTS: "true"
+  DEPLOYMENT_TIMEOUT: "300"
+
+# Define stages
+stages:
+  - validate
+  - analyze
+  - report
+  - deploy
+  - notify
+  - metrics
+
+# Global cache configuration
+cache:
+  key: "${CACHE_VERSION}-${CI_COMMIT_REF_SLUG}-python-${PYTHON_VERSION}"
+  paths:
+    - .cache/pip
+    - .cache/code-review-assistant
+    - .venv/
+  policy: pull-push
+
+# Global before_script
+before_script:
+  - echo "🚀 Starting Code Review Pipeline"
+  - echo "Branch: $CI_COMMIT_REF_NAME"
+  - echo "Commit: $CI_COMMIT_SHORT_SHA"
+  - python --version
+  - pip --version
+
+# =====================================
+# VALIDATION STAGE
+# =====================================
+
+validate:config:
+  stage: validate
+  image: python:${PYTHON_VERSION}-slim
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git
+    - pip install --upgrade pip
+  script:
+    - echo "📋 Validating configuration and setup"
+    - |
+      # Install minimal dependencies for validation
+      pip install pyyaml dataclasses-json
+
+      # Validate configuration files
+      if [ -f ".codereview.yaml" ] || [ -f ".codereview.yml" ]; then
+        python -c "
+        import yaml
+        import sys
+
+        config_files = ['.codereview.yaml', '.codereview.yml']
+        for config_file in config_files:
+          try:
+            with open(config_file, 'r') as f:
+              config = yaml.safe_load(f)
+              print(f'✅ {config_file} is valid YAML')
+              print(f'Version: {config.get(\"version\", \"unknown\")}')
+              break
+          except FileNotFoundError:
+            continue
+          except yaml.YAMLError as e:
+            print(f'❌ {config_file} is invalid: {e}')
+            sys.exit(1)
+        else:
+          print('ℹ️ No configuration file found, will use defaults')
+        "
+      else
+        echo "ℹ️ No configuration file found, will use defaults"
+      fi
+
+      # Validate Python syntax in source files
+      find src/ -name "*.py" -exec python -m py_compile {} \;
+      echo "✅ Python syntax validation passed"
+
+      # Check dependencies
+      pip install -r requirements.txt
+      echo "✅ Dependencies installation successful"
+  artifacts:
+    reports:
+      junit: validation-report.xml
+    when: always
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+
+validate:changes:
+  stage: validate
+  image: alpine:latest
+  variables:
+    GIT_DEPTH: "0"
+  script:
+    - echo "📊 Analyzing changes"
+    - apk add --no-cache git
+    - |
+      # Check if we need to run analysis based on changed files
+      if [ "$CI_PIPELINE_SOURCE" = "merge_request_event" ]; then
+        CHANGED_FILES=$(git diff --name-only $CI_MERGE_REQUEST_TARGET_BRANCH_SHA..$CI_COMMIT_SHA)
+      else
+        CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
+      fi
+
+      echo "Changed files:"
+      echo "$CHANGED_FILES"
+
+      # Check if any code files changed
+      CODE_CHANGED=$(echo "$CHANGED_FILES" | grep -E '\.(py|js|ts|jsx|tsx|java|go|rs|cpp|c|h)$' || true)
+      CONFIG_CHANGED=$(echo "$CHANGED_FILES" | grep -E '\.codereview\.(yaml|yml)$|requirements\.txt$' || true)
+
+      if [ -n "$CODE_CHANGED" ] || [ -n "$CONFIG_CHANGED" ] || [ "$CI_PIPELINE_SOURCE" = "schedule" ]; then
+        echo "SHOULD_RUN_ANALYSIS=true" > analysis.env
+        echo "🔍 Analysis required - code or config changes detected"
+      else
+        echo "SHOULD_RUN_ANALYSIS=false" > analysis.env
+        echo "⏭️ Skipping analysis - no relevant changes detected"
+      fi
+  artifacts:
+    reports:
+      dotenv: analysis.env
+    expire_in: 1 hour
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+
+# =====================================
+# ANALYSIS STAGE
+# =====================================
+
+.analysis_template: &analysis_template
+  stage: analyze
+  image: python:${PYTHON_VERSION}
+  needs: ["validate:config", "validate:changes"]
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  before_script:
+    - echo "🔍 Setting up analysis environment"
+    - apt-get update -qq && apt-get install -y -qq git
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+    - pip install -e .
+  script:
+    - |
+      # Skip if analysis not needed
+      if [ "${SHOULD_RUN_ANALYSIS}" = "false" ]; then
+        echo "⏭️ Skipping analysis - no relevant changes"
+        mkdir -p results
+        echo '{"issues": [], "summary": {"total_issues": 0}}' > results/analysis-${ANALYSIS_TYPE}.json
+        exit 0
+      fi
+
+      echo "🚀 Starting ${ANALYSIS_TYPE} analysis"
+      START_TIME=$(date +%s)
+
+      # Determine analysis mode
+      if [ "$CI_PIPELINE_SOURCE" = "merge_request_event" ]; then
+        ANALYSIS_MODE="git-diff"
+        BASE_REF="${CI_MERGE_REQUEST_TARGET_BRANCH_SHA}"
+        HEAD_REF="${CI_COMMIT_SHA}"
+        EXTRA_ARGS="--base-ref=${BASE_REF} --head-ref=${HEAD_REF}"
+        echo "🔄 Analyzing MR diff: ${BASE_REF}..${HEAD_REF}"
+      else
+        ANALYSIS_MODE="files"
+        EXTRA_ARGS="--include-path=src/ --include-path=tests/"
+        echo "📁 Analyzing all files"
+      fi
+
+      # Create results directory
+      mkdir -p results
+
+      # Run analysis with error handling
+      if python -m src.main \
+        --mode="${ANALYSIS_MODE}" \
+        --analysis-type="${ANALYSIS_TYPE}" \
+        --severity-threshold="${CODEREVIEW_SEVERITY_THRESHOLD}" \
+        --output-format="${CODEREVIEW_OUTPUT_FORMAT}" \
+        --output-file="results/analysis-${ANALYSIS_TYPE}.json" \
+        --metrics-file="results/metrics-${ANALYSIS_TYPE}.json" \
+        --enable-cache="${CODEREVIEW_ENABLE_CACHE}" \
+        --performance-tracking="${CODEREVIEW_PERFORMANCE_TRACKING}" \
+        ${EXTRA_ARGS}; then
+
+        END_TIME=$(date +%s)
+        DURATION=$((END_TIME - START_TIME))
+        echo "✅ ${ANALYSIS_TYPE} analysis completed in ${DURATION} seconds"
+
+        # Extract metrics
+        if [ -f "results/analysis-${ANALYSIS_TYPE}.json" ]; then
+          TOTAL_ISSUES=$(python -c "
+          import json
+          with open('results/analysis-${ANALYSIS_TYPE}.json') as f:
+              data = json.load(f)
+              print(len(data.get('issues', [])))
+          ")
+
+          CRITICAL_ISSUES=$(python -c "
+          import json
+          with open('results/analysis-${ANALYSIS_TYPE}.json') as f:
+              data = json.load(f)
+              issues = data.get('issues', [])
+              critical = len([i for i in issues if i.get('severity') == 'error'])
+              print(critical)
+          ")
+
+          echo "📊 Results: ${TOTAL_ISSUES} total issues, ${CRITICAL_ISSUES} critical"
+
+          # Store metrics for GitLab insights
+          cat > metrics.txt << EOF
+          execution_time_seconds:${DURATION}
+          total_issues:${TOTAL_ISSUES}
+          critical_issues:${CRITICAL_ISSUES}
+          analysis_type:${ANALYSIS_TYPE}
+          EOF
+
+          # Check failure conditions
+          if [ "${CRITICAL_ISSUES}" -gt 5 ]; then
+            echo "❌ Too many critical issues: ${CRITICAL_ISSUES} (max: 5)"
+            exit 1
+          fi
+        else
+          echo "⚠️ Analysis completed but no results file generated"
+        fi
+      else
+        echo "❌ Analysis failed"
+        exit 1
+      fi
+  artifacts:
+    reports:
+      codequality: results/analysis-${ANALYSIS_TYPE}.json
+    paths:
+      - results/
+      - metrics.txt
+      - "*.log"
+    expire_in: 1 week
+    when: always
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+
+# Specific analysis jobs
+analyze:security:
+  <<: *analysis_template
+  variables:
+    ANALYSIS_TYPE: "security"
+  after_script:
+    - |
+      # Generate SAST report for GitLab Security Dashboard
+      if [ -f "results/analysis-security.json" ]; then
+        python -c "
+        import json
+
+        # Convert to GitLab SAST format
+        with open('results/analysis-security.json') as f:
+            data = json.load(f)
+
+        sast_report = {
+            'version': '14.0.0',
+            'vulnerabilities': []
+        }
+
+        for issue in data.get('issues', []):
+            if 'security' in issue.get('checker_name', ''):
+                vulnerability = {
+                    'id': f'codereview-{hash(issue.get(\"message\", \"\"))}',
+                    'category': 'sast',
+                    'name': issue.get('rule_name', 'Security Issue'),
+                    'message': issue.get('message', ''),
+                    'severity': issue.get('severity', 'info').title(),
+                    'confidence': 'Medium',
+                    'location': {
+                        'file': issue.get('file_path', ''),
+                        'start_line': issue.get('line_number', 1)
+                    },
+                    'identifiers': [{
+                        'type': 'code_review_assistant',
+                        'name': f'{issue.get(\"checker_name\", \"\")}.{issue.get(\"rule_name\", \"\")}',
+                        'value': issue.get('rule_name', '')
+                    }]
+                }
+                sast_report['vulnerabilities'].append(vulnerability)
+
+        with open('gl-sast-report.json', 'w') as f:
+            json.dump(sast_report, f, indent=2)
+        "
+      fi
+  artifacts:
+    reports:
+      sast: gl-sast-report.json
+
+analyze:complexity:
+  <<: *analysis_template
+  variables:
+    ANALYSIS_TYPE: "complexity"
+
+analyze:style:
+  <<: *analysis_template
+  variables:
+    ANALYSIS_TYPE: "style"
+
+analyze:all:
+  <<: *analysis_template
+  variables:
+    ANALYSIS_TYPE: "all"
+  allow_failure: false
+
+# =====================================
+# REPORTING STAGE
+# =====================================
+
+report:combine:
+  stage: report
+  image: python:${PYTHON_VERSION}-slim
+  needs:
+    - job: analyze:security
+      artifacts: true
+    - job: analyze:complexity
+      artifacts: true
+    - job: analyze:style
+      artifacts: true
+    - job: analyze:all
+      artifacts: true
+  script:
+    - echo "📊 Combining analysis results"
+    - pip install -r requirements.txt
+    - |
+      # Combine all results
+      python -c "
+      import json
+      import glob
+      import os
+      from datetime import datetime
+
+      combined = {
+          'timestamp': datetime.now().isoformat(),
+          'pipeline_id': '$CI_PIPELINE_ID',
+          'commit_sha': '$CI_COMMIT_SHA',
+          'branch': '$CI_COMMIT_REF_NAME',
+          'analyses': {},
+          'summary': {
+              'total_issues': 0,
+              'critical_issues': 0,
+              'files_analyzed': 0,
+              'total_execution_time': 0
+          }
+      }
+
+      # Process each analysis result
+      for result_file in glob.glob('results/analysis-*.json'):
+          try:
+              with open(result_file) as f:
+                  data = json.load(f)
+                  analysis_type = result_file.split('analysis-')[1].split('.json')[0]
+                  combined['analyses'][analysis_type] = data
+
+                  # Update summary
+                  issues = data.get('issues', [])
+                  combined['summary']['total_issues'] += len(issues)
+                  combined['summary']['critical_issues'] += len([i for i in issues if i.get('severity') == 'error'])
+                  combined['summary']['files_analyzed'] = max(
+                      combined['summary']['files_analyzed'],
+                      data.get('summary', {}).get('files_analyzed', 0)
+                  )
+          except Exception as e:
+              print(f'Warning: Could not process {result_file}: {e}')
+
+      # Process metrics
+      for metrics_file in glob.glob('metrics.txt'):
+          try:
+              with open(metrics_file) as f:
+                  for line in f:
+                      if line.startswith('execution_time_seconds:'):
+                          time_val = int(line.split(':')[1].strip())
+                          combined['summary']['total_execution_time'] += time_val
+          except Exception as e:
+              print(f'Warning: Could not process metrics: {e}')
+
+      # Save combined results
+      with open('combined-report.json', 'w') as f:
+          json.dump(combined, f, indent=2)
+
+      # Print summary
+      print(f'📈 Final Summary:')
+      print(f'- Total Issues: {combined[\"summary\"][\"total_issues\"]}')
+      print(f'- Critical Issues: {combined[\"summary\"][\"critical_issues\"]}')
+      print(f'- Files Analyzed: {combined[\"summary\"][\"files_analyzed\"]}')
+      print(f'- Total Execution Time: {combined[\"summary\"][\"total_execution_time\"]}s')
+      "
+
+      # Generate HTML dashboard
+      python -m src.formatters.cli \
+        --input combined-report.json \
+        --format html \
+        --sub-format dashboard \
+        --output dashboard.html \
+        --theme gitlab
+
+      echo "✅ Report generation completed"
+  artifacts:
+    paths:
+      - combined-report.json
+      - dashboard.html
+    expire_in: 30 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+
+report:mr_comment:
+  stage: report
+  image: alpine:latest
+  needs: ["report:combine"]
+  before_script:
+    - apk add --no-cache curl jq
+  script:
+    - |
+      if [ "$CI_PIPELINE_SOURCE" != "merge_request_event" ]; then
+        echo "⏭️ Skipping MR comment - not a merge request"
+        exit 0
+      fi
+
+      echo "💬 Creating merge request comment"
+
+      # Read combined results
+      TOTAL_ISSUES=$(jq -r '.summary.total_issues' combined-report.json)
+      CRITICAL_ISSUES=$(jq -r '.summary.critical_issues' combined-report.json)
+      FILES_ANALYZED=$(jq -r '.summary.files_analyzed' combined-report.json)
+      EXECUTION_TIME=$(jq -r '.summary.total_execution_time' combined-report.json)
+
+      # Create comment body
+      if [ "$TOTAL_ISSUES" = "0" ]; then
+        COMMENT_BODY="## 🎉 Code Review: All Clear!
+
+        ✅ **No issues found** in $FILES_ANALYZED files.
+
+        Your code follows all configured standards and best practices!"
+      else
+        COMMENT_BODY="## 📋 Code Review Results
+
+        Found **$TOTAL_ISSUES issues** in $FILES_ANALYZED files:
+
+        $(if [ "$CRITICAL_ISSUES" != "0" ]; then echo "🔴 **$CRITICAL_ISSUES critical issues** - please fix before merging"; fi)
+
+        ### Analysis Summary
+        | Metric | Value |
+        |--------|-------|
+        | Total Issues | $TOTAL_ISSUES |
+        | Critical Issues | $CRITICAL_ISSUES |
+        | Files Analyzed | $FILES_ANALYZED |
+        | Execution Time | ${EXECUTION_TIME}s |
+
+        [📊 View detailed dashboard]($CI_PIPELINE_URL/-/jobs/$CI_JOB_ID/artifacts/browse)"
+      fi
+
+      # Post comment using GitLab API
+      curl --request POST \
+        --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+        --header "Content-Type: application/json" \
+        --data "{\"body\": \"$COMMENT_BODY\"}" \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID/notes"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
+
+# =====================================
+# DEPLOYMENT STAGE
+# =====================================
+
+pages:
+  stage: deploy
+  image: alpine:latest
+  needs: ["report:combine"]
+  script:
+    - echo "🚀 Deploying dashboard to GitLab Pages"
+    - mkdir public
+    - cp dashboard.html public/index.html
+    - cp combined-report.json public/data.json
+    - |
+      # Create deployment info with exit codes
+      cat > public/deploy-info.json << EOF
+      {
+        "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+        "pipeline_id": "$CI_PIPELINE_ID",
+        "commit_sha": "$CI_COMMIT_SHA",
+        "branch": "$CI_COMMIT_REF_NAME",
+        "deployment_status": "success",
+        "exit_code": 0
+      }
+      EOF
+    - echo "✅ Dashboard deployed with exit code 0"
+    - echo "DEPLOYMENT_STATUS=success" > deploy.env
+    - echo "EXIT_CODE=0" >> deploy.env
+  artifacts:
+    paths:
+      - public
+    reports:
+      dotenv: deploy.env
+    expire_in: 30 days
+  after_script:
+    - |
+      if [ $? -ne 0 ]; then
+        echo "❌ Deployment failed with exit code $?"
+        echo "DEPLOYMENT_STATUS=failed" > deploy.env
+        echo "EXIT_CODE=$?" >> deploy.env
+      fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+deploy:staging:
+  stage: deploy
+  image: alpine:latest
+  needs: ["report:combine"]
+  script:
+    - echo "🚀 Deploying to staging environment"
+    - |
+      # Enhanced deployment script with validation
+      CRITICAL_ISSUES=$(jq -r '.summary.critical_issues // 0' combined-report.json)
+      TOTAL_ISSUES=$(jq -r '.summary.total_issues // 0' combined-report.json)
+
+      echo "📊 Pre-deployment validation:"
+      echo "- Critical Issues: $CRITICAL_ISSUES"
+      echo "- Total Issues: $TOTAL_ISSUES"
+
+      # Exit with proper codes for pipeline integration
+      if [ "$CRITICAL_ISSUES" -gt 5 ]; then
+        echo "❌ Too many critical issues for deployment: $CRITICAL_ISSUES"
+        echo "DEPLOYMENT_STATUS=blocked" > deploy.env
+        echo "EXIT_CODE=2" >> deploy.env
+        exit 2
+      elif [ "$TOTAL_ISSUES" -gt 50 ]; then
+        echo "⚠️ High number of issues, deploying with warning: $TOTAL_ISSUES"
+        echo "DEPLOYMENT_STATUS=warning" > deploy.env
+        echo "EXIT_CODE=0" >> deploy.env
+      else
+        echo "✅ Quality gate passed, proceeding with deployment"
+        echo "DEPLOYMENT_STATUS=success" > deploy.env
+        echo "EXIT_CODE=0" >> deploy.env
+      fi
+
+      # Simulate deployment process with timeout
+      timeout ${DEPLOYMENT_TIMEOUT} sh -c '
+        echo "🔧 Running deployment steps..."
+        sleep 5
+        echo "📦 Packaging application..."
+        sleep 3
+        echo "🚀 Deploying to staging..."
+        sleep 2
+        echo "✅ Deployment completed successfully"
+      ' || {
+        echo "❌ Deployment timed out after ${DEPLOYMENT_TIMEOUT}s"
+        echo "DEPLOYMENT_STATUS=timeout" > deploy.env
+        echo "EXIT_CODE=124" >> deploy.env
+        exit 124
+      }
+  artifacts:
+    reports:
+      dotenv: deploy.env
+    expire_in: 1 day
+  environment:
+    name: staging
+    url: https://staging.example.com
+    deployment_tier: staging
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: manual
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+# =====================================
+# NOTIFICATION STAGE
+# =====================================
+
+notify:teams:
+  stage: notify
+  image: alpine:latest
+  needs: ["report:combine"]
+  before_script:
+    - apk add --no-cache curl jq
+  script:
+    - |
+      if [ -z "$TEAMS_WEBHOOK_URL" ]; then
+        echo "⏭️ Skipping Teams notification - webhook not configured"
+        exit 0
+      fi
+
+      echo "📢 Sending Teams notification"
+
+      # Read results
+      TOTAL_ISSUES=$(jq -r '.summary.total_issues' combined-report.json)
+      CRITICAL_ISSUES=$(jq -r '.summary.critical_issues' combined-report.json)
+
+      # Determine status and color
+      if [ "$TOTAL_ISSUES" = "0" ]; then
+        STATUS="✅ All Clear"
+        COLOR="28a745"
+      elif [ "$CRITICAL_ISSUES" != "0" ]; then
+        STATUS="❌ $CRITICAL_ISSUES Critical Issues"
+        COLOR="dc3545"
+      else
+        STATUS="⚠️ $TOTAL_ISSUES Issues Found"
+        COLOR="ffc107"
+      fi
+
+      # Create Teams message
+      cat > teams-message.json << EOF
+      {
+        "@type": "MessageCard",
+        "@context": "https://schema.org/extensions",
+        "themeColor": "$COLOR",
+        "summary": "Code Review: $STATUS",
+        "sections": [{
+          "activityTitle": "Code Review Analysis: $STATUS",
+          "activitySubtitle": "Project: $CI_PROJECT_NAME",
+          "facts": [
+            {"name": "Branch", "value": "$CI_COMMIT_REF_NAME"},
+            {"name": "Total Issues", "value": "$TOTAL_ISSUES"},
+            {"name": "Critical Issues", "value": "$CRITICAL_ISSUES"},
+            {"name": "Pipeline", "value": "#$CI_PIPELINE_ID"}
+          ]
+        }],
+        "potentialAction": [{
+          "@type": "OpenUri",
+          "name": "View Pipeline",
+          "targets": [{"os": "default", "uri": "$CI_PIPELINE_URL"}]
+        }]
+      }
+      EOF
+
+      # Send notification
+      curl -X POST -H "Content-Type: application/json" \
+        -d @teams-message.json \
+        "$TEAMS_WEBHOOK_URL"
+
+      echo "✅ Teams notification sent"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: on_failure
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: on_failure
+
+# =====================================
+# METRICS AND MONITORING STAGE
+# =====================================
+
+metrics:performance:
+  stage: metrics
+  image: python:${PYTHON_VERSION}-slim
+  needs: ["report:combine", "deploy:staging", "pages"]
+  script:
+    - echo "📈 Collecting comprehensive performance metrics"
+    - |
+      # Enhanced metrics collection with trend analysis
+      python -c "
+      import json, os
+      from datetime import datetime, timedelta
+
+      # Read analysis results
+      try:
+          with open('combined-report.json') as f:
+              data = json.load(f)
+      except FileNotFoundError:
+          data = {'summary': {}}
+
+      summary = data.get('summary', {})
+      baseline_threshold = int('${CODEREVIEW_BASELINE_THRESHOLD}')
+      execution_time = summary.get('total_execution_time', 0)
+
+      # Performance analysis
+      performance_status = 'within_baseline' if execution_time <= baseline_threshold else 'exceeds_baseline'
+
+      # Create comprehensive metrics
+      metrics = {
+          'timestamp': datetime.now().isoformat(),
+          'pipeline_id': '$CI_PIPELINE_ID',
+          'commit_sha': '$CI_COMMIT_SHA',
+          'branch': '$CI_COMMIT_REF_NAME',
+          'metrics': [
+              {
+                  'name': 'code_review_total_issues',
+                  'value': summary.get('total_issues', 0),
+                  'unit': 'count',
+                  'tags': {'severity': 'all', 'type': 'count'}
+              },
+              {
+                  'name': 'code_review_critical_issues',
+                  'value': summary.get('critical_issues', 0),
+                  'unit': 'count',
+                  'tags': {'severity': 'critical', 'type': 'count'}
+              },
+              {
+                  'name': 'code_review_execution_time',
+                  'value': execution_time,
+                  'unit': 'seconds',
+                  'tags': {'type': 'performance', 'status': performance_status}
+              },
+              {
+                  'name': 'code_review_files_analyzed',
+                  'value': summary.get('files_analyzed', 0),
+                  'unit': 'count',
+                  'tags': {'type': 'coverage'}
+              },
+              {
+                  'name': 'code_review_cache_hit_rate',
+                  'value': 1 if '${CODEREVIEW_ENABLE_CACHE}' == 'true' else 0,
+                  'unit': 'ratio',
+                  'tags': {'type': 'efficiency'}
+              },
+              {
+                  'name': 'deployment_status',
+                  'value': 1 if '${DEPLOYMENT_STATUS:-success}' == 'success' else 0,
+                  'unit': 'boolean',
+                  'tags': {'type': 'deployment', 'status': '${DEPLOYMENT_STATUS:-success}'}
+              }
+          ],
+          'alerts': []
+      }
+
+      # Performance alerting
+      if execution_time > baseline_threshold and '${ENABLE_PERFORMANCE_ALERTS}' == 'true':
+          metrics['alerts'].append({
+              'type': 'performance',
+              'severity': 'warning',
+              'message': f'Execution time ({execution_time}s) exceeds baseline ({baseline_threshold}s)',
+              'threshold': baseline_threshold,
+              'actual_value': execution_time
+          })
+
+      # Quality gate alerts
+      critical_issues = summary.get('critical_issues', 0)
+      if critical_issues > 5:
+          metrics['alerts'].append({
+              'type': 'quality',
+              'severity': 'error',
+              'message': f'Critical issues ({critical_issues}) exceed threshold (5)',
+              'threshold': 5,
+              'actual_value': critical_issues
+          })
+
+      with open('performance-metrics.json', 'w') as f:
+          json.dump(metrics, f, indent=2)
+
+      print(f'📊 Performance Status: {performance_status}')
+      print(f'⏱️  Execution Time: {execution_time}s (baseline: {baseline_threshold}s)')
+      print(f'🐛 Critical Issues: {critical_issues}')
+      print(f'🚨 Alerts Generated: {len(metrics[\"alerts\"])}')
+
+      # Set exit code based on alerts
+      exit_code = 0
+      for alert in metrics['alerts']:
+          if alert['severity'] == 'error':
+              exit_code = 1
+              break
+          elif alert['severity'] == 'warning' and exit_code == 0:
+              exit_code = 0  # Warnings don't fail the pipeline
+
+      with open('metrics-exit-code.txt', 'w') as f:
+          f.write(str(exit_code))
+
+      print(f'📋 Metrics collection completed with exit code: {exit_code}')
+      "
+    - |
+      # Generate trend report
+      echo "📊 Generating trend analysis report..."
+      python -c "
+      import json, os
+      from datetime import datetime, timedelta
+
+      # Create a simple trend analysis
+      trend_data = {
+          'generated_at': datetime.now().isoformat(),
+          'pipeline_id': '$CI_PIPELINE_ID',
+          'trend_period': '30_days',
+          'summary': {
+              'current_run': {
+                  'execution_time': $(jq -r '.metrics[] | select(.name==\"code_review_execution_time\") | .value' performance-metrics.json),
+                  'total_issues': $(jq -r '.metrics[] | select(.name==\"code_review_total_issues\") | .value' performance-metrics.json),
+                  'critical_issues': $(jq -r '.metrics[] | select(.name==\"code_review_critical_issues\") | .value' performance-metrics.json)
+              }
+          }
+      }
+
+      with open('trend-analysis.json', 'w') as f:
+          json.dump(trend_data, f, indent=2)
+      "
+    - echo "✅ Metrics collection and analysis completed"
+  artifacts:
+    reports:
+      metrics: performance-metrics.json
+    paths:
+      - performance-metrics.json
+      - trend-analysis.json
+      - metrics-exit-code.txt
+    expire_in: ${METRICS_RETENTION_DAYS} days
+  after_script:
+    - |
+      # Handle exit code from metrics analysis
+      if [ -f "metrics-exit-code.txt" ]; then
+        EXIT_CODE=$(cat metrics-exit-code.txt)
+        if [ "$EXIT_CODE" != "0" ]; then
+          echo "❌ Metrics analysis failed with critical alerts"
+          exit $EXIT_CODE
+        fi
+      fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+metrics:summary:
+  stage: metrics
+  image: alpine:latest
+  needs: ["metrics:performance"]
+  script:
+    - echo "📋 Pipeline Summary and Final Status"
+    - |
+      # Final pipeline summary with all exit codes
+      echo "🔍 Code Review Pipeline Completed"
+      echo "========================================"
+      echo "📊 Pipeline ID: $CI_PIPELINE_ID"
+      echo "🌿 Branch: $CI_COMMIT_REF_NAME"
+      echo "📦 Commit: $CI_COMMIT_SHORT_SHA"
+      echo "👤 Triggered by: $CI_PIPELINE_SOURCE"
+
+      # Check deployment status
+      DEPLOYMENT_STATUS="${DEPLOYMENT_STATUS:-not_run}"
+      echo "🚀 Deployment Status: $DEPLOYMENT_STATUS"
+
+      # Check metrics exit code
+      METRICS_EXIT_CODE="${EXIT_CODE:-0}"
+      echo "📈 Metrics Exit Code: $METRICS_EXIT_CODE"
+
+      # Final exit code determination
+      if [ "$METRICS_EXIT_CODE" != "0" ]; then
+        echo "❌ Pipeline failed due to critical metrics alerts"
+        echo "Final Exit Code: $METRICS_EXIT_CODE"
+        exit $METRICS_EXIT_CODE
+      elif [ "$DEPLOYMENT_STATUS" = "failed" ] || [ "$DEPLOYMENT_STATUS" = "timeout" ]; then
+        echo "❌ Pipeline failed due to deployment issues"
+        echo "Final Exit Code: 2"
+        exit 2
+      else
+        echo "✅ Pipeline completed successfully"
+        echo "Final Exit Code: 0"
+        exit 0
+      fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'

@@ -1,0 +1,187 @@
+# Code Review Rules Configuration
+# This file defines the rules and standards for code review analysis
+
+# File type configuration
+file_types:
+  include:  # Only analyze these file types (empty = analyze all)
+    - .py
+    - .js
+    - .ts
+    - .jsx
+    - .tsx
+    - .java
+    - .c
+    - .cpp
+    - .h
+    - .hpp
+    - .go
+    - .rs
+    - .rb
+    - .php
+    - .swift
+    - .kt
+    - .scala
+    - .sh
+    - .yml
+    - .yaml
+    - .json
+    - .xml
+    - .md
+
+  exclude:  # Never analyze these file types
+    - .min.js
+    - .min.css
+    - .map
+    - .log
+    - .tmp
+
+  exclude_paths:  # Skip files containing these path patterns
+    - node_modules/
+    - .git/
+    - __pycache__/
+    - .pytest_cache/
+    - build/
+    - dist/
+    - target/
+    - .venv/
+    - venv/
+
+# General limits
+limits:
+  max_file_size: 1048576  # 1MB in bytes
+  max_files: 1000
+
+# Language-specific rules
+languages:
+  .py:
+    language: python
+    max_line_length: 88  # Black formatter default
+    max_file_lines: 500
+    no_tabs: true
+    rules:
+      - no_wildcard_imports
+      - use_logging_not_print
+      - no_multiple_statements
+      - require_docstrings
+      - prefer_f_strings
+      - suggest_list_comprehensions
+
+  .js:
+    language: javascript
+    max_line_length: 100
+    max_file_lines: 300
+    no_tabs: true
+    rules:
+      - no_console_statements
+      - no_var_usage
+      - prefer_const_let
+      - require_semicolons
+
+  .ts:
+    language: typescript
+    max_line_length: 100
+    max_file_lines: 300
+    no_tabs: true
+    rules:
+      - no_console_statements
+      - no_var_usage
+      - prefer_const_let
+      - require_type_annotations
+      - no_any_type
+
+  .jsx:
+    language: javascript
+    max_line_length: 100
+    max_file_lines: 300
+    no_tabs: true
+    rules:
+      - no_console_statements
+      - no_var_usage
+      - prefer_const_let
+      - jsx_props_validation
+
+  .tsx:
+    language: typescript
+    max_line_length: 100
+    max_file_lines: 300
+    no_tabs: true
+    rules:
+      - no_console_statements
+      - no_var_usage
+      - prefer_const_let
+      - require_type_annotations
+      - jsx_props_validation
+
+  .java:
+    language: java
+    max_line_length: 120
+    max_file_lines: 500
+    no_tabs: true
+    rules:
+      - require_javadoc
+      - no_system_out
+      - proper_exception_handling
+
+  .go:
+    language: go
+    max_line_length: 120
+    max_file_lines: 500
+    no_tabs: false  # Go uses tabs
+    rules:
+      - proper_error_handling
+      - no_fmt_print
+      - require_comments
+
+  .rs:
+    language: rust
+    max_line_length: 100
+    max_file_lines: 500
+    no_tabs: true
+    rules:
+      - no_println_macro
+      - proper_error_handling
+      - require_documentation
+
+# Issue severity levels
+severity:
+  error:    # Code won't work or violates critical standards
+    - syntax_error
+    - undefined_variable
+    - security_vulnerability
+
+  warning:  # Code works but violates important standards
+    - line_too_long
+    - wildcard_import
+    - var_usage
+    - tab_character
+    - multiple_statements
+
+  info:     # Suggestions for improvement
+    - todo_comment
+    - print_statement
+    - console_statement
+    - string_formatting
+    - list_comprehension
+    - missing_docstring
+    - trailing_whitespace
+
+# Output configuration
+output:
+  show_context_lines: 3  # Lines of context around issues
+  group_by_file: true
+  show_line_numbers: true
+  show_severity: true
+
+  # Formatting options
+  formats:
+    terminal:
+      colors: true
+      unicode: true
+
+    markdown:
+      include_toc: true
+      code_blocks: true
+
+    json:
+      pretty_print: true
+      include_metadata: true

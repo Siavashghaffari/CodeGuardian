@@ -1,0 +1,289 @@
+# Code Review Assistant Configuration
+# This file demonstrates the flexible configuration system
+
+version: "1.0"
+
+# Base configurations to extend (optional)
+# extends:
+#   - "team-defaults.yaml"
+#   - "security-focused.yaml"
+
+# Global severity settings
+severity_threshold: "suggestion"  # info, suggestion, warning, error
+fail_on_severity: "error"  # Build fails if issues with this severity or higher are found
+max_issues_per_run: 100
+
+# Checker configurations
+checkers:
+  complexity:
+    enabled: true
+    severity_override: "warning"  # Override all rule severities for this checker
+    rules:
+      max_cyclomatic_complexity:
+        enabled: true
+        severity: "warning"
+        options:
+          threshold: 10
+        file_types: ["python", "javascript", "typescript"]
+
+      max_cognitive_complexity:
+        enabled: true
+        severity: "warning"
+        options:
+          threshold: 15
+
+      max_function_length:
+        enabled: true
+        severity: "suggestion"
+        options:
+          threshold: 50
+          ignore_patterns: ["**/tests/**", "**/*_test.py"]
+
+  security:
+    enabled: true
+    rules:
+      hardcoded_secrets:
+        enabled: true
+        severity: "error"
+        options:
+          patterns:
+            - "password\\s*=\\s*['\"][^'\"]+['\"]"
+            - "api_key\\s*=\\s*['\"][^'\"]+['\"]"
+            - "secret\\s*=\\s*['\"][^'\"]+['\"]"
+
+      sql_injection_risk:
+        enabled: true
+        severity: "error"
+        file_types: ["python", "javascript"]
+
+      xss_risk:
+        enabled: true
+        severity: "error"
+        file_types: ["javascript", "typescript"]
+
+      unsafe_eval:
+        enabled: true
+        severity: "warning"
+
+  style:
+    enabled: true
+    rules:
+      line_too_long:
+        enabled: true
+        severity: "suggestion"
+        # File-specific options will be merged from file_types section
+
+      trailing_whitespace:
+        enabled: true
+        severity: "suggestion"
+
+      inconsistent_indentation:
+        enabled: true
+        severity: "warning"
+
+  naming:
+    enabled: true
+    rules:
+      invalid_function_name:
+        enabled: true
+        severity: "warning"
+
+      invalid_variable_name:
+        enabled: true
+        severity: "suggestion"
+
+      invalid_class_name:
+        enabled: true
+        severity: "warning"
+
+  variables:
+    enabled: true
+    rules:
+      unused_variable:
+        enabled: true
+        severity: "warning"
+        options:
+          ignore_underscore_prefix: true
+
+      undefined_variable:
+        enabled: true
+        severity: "error"
+
+  error_handling:
+    enabled: true
+    rules:
+      bare_except:
+        enabled: true
+        severity: "warning"
+        file_types: ["python"]
+
+      missing_error_handling:
+        enabled: true
+        severity: "suggestion"
+
+# File type specific configurations
+file_types:
+  python:
+    max_line_length: 88  # Black formatter default
+    max_function_length: 50
+    max_complexity: 10
+    naming_conventions:
+      function: "snake_case"
+      variable: "snake_case"
+      class: "PascalCase"
+      constant: "UPPER_CASE"
+      private: "_snake_case"
+    custom_rules:
+      no_print_statements:
+        enabled: true
+        severity: "suggestion"
+        options:
+          allow_in_tests: true
+
+  javascript:
+    max_line_length: 100
+    max_function_length: 40
+    max_complexity: 8
+    naming_conventions:
+      function: "camelCase"
+      variable: "camelCase"
+      class: "PascalCase"
+      constant: "UPPER_CASE"
+    custom_rules:
+      prefer_const:
+        enabled: true
+        severity: "suggestion"
+
+      no_var_declarations:
+        enabled: true
+        severity: "warning"
+
+  typescript:
+    max_line_length: 100
+    max_function_length: 40
+    max_complexity: 8
+    naming_conventions:
+      function: "camelCase"
+      variable: "camelCase"
+      class: "PascalCase"
+      interface: "PascalCase"
+      type: "PascalCase"
+      enum: "PascalCase"
+    custom_rules:
+      require_type_annotations:
+        enabled: true
+        severity: "warning"
+        options:
+          functions: true
+          variables: false
+
+# File patterns to ignore
+ignore_patterns:
+  - pattern: "*.pyc"
+    type: "glob"
+    description: "Python compiled files"
+
+  - pattern: "node_modules/**"
+    type: "glob"
+    description: "Node.js dependencies"
+
+  - pattern: ".git/**"
+    type: "glob"
+    description: "Git directory"
+
+  - pattern: "__pycache__/**"
+    type: "glob"
+    description: "Python cache directories"
+
+  - pattern: "*.min.js"
+    type: "glob"
+    description: "Minified JavaScript files"
+
+  - pattern: "dist/**"
+    type: "glob"
+    description: "Distribution/build directories"
+
+  - pattern: "build/**"
+    type: "glob"
+    description: "Build directories"
+
+  - pattern: "coverage/**"
+    type: "glob"
+    description: "Coverage reports"
+
+  - pattern: "\.env"
+    type: "regex"
+    description: "Environment files with secrets"
+
+# File patterns to include (if not specified, includes common code files)
+include_patterns:
+  - "**/*.py"
+  - "**/*.js"
+  - "**/*.ts"
+  - "**/*.jsx"
+  - "**/*.tsx"
+  - "**/*.vue"
+  - "**/*.go"
+  - "**/*.java"
+  - "**/*.cpp"
+  - "**/*.c"
+  - "**/*.h"
+
+# Output configuration
+output:
+  format: "terminal"  # terminal, json, markdown
+  show_suggestions: true
+  show_line_numbers: true
+  show_severity_colors: true
+  max_issues_per_file: 20
+  group_by_severity: false
+
+# Git integration settings
+git:
+  enabled: false
+  focus_on_changes_only: true
+  context_lines: 3
+  post_comments: false
+  comment_template: |
+    **{{severity}}**: {{message}}
+
+    {{suggestion}}
+
+    *Line {{line_number}} in {{file_path}}*
+
+  platforms:
+    github:
+      token: "${GITHUB_TOKEN}"  # Use environment variable
+      post_review_summary: true
+      max_comments_per_review: 20
+
+    gitlab:
+      token: "${GITLAB_TOKEN}"
+      url: "https://gitlab.com"  # Default GitLab instance
+      post_review_summary: true
+
+# Team-specific custom rules
+custom_rules:
+  team_standards:
+    no_todo_comments:
+      enabled: true
+      severity: "suggestion"
+      pattern: "TODO|FIXME|HACK"
+      message: "Consider creating a ticket instead of TODO comments"
+
+    require_docstrings:
+      enabled: true
+      severity: "warning"
+      file_types: ["python"]
+      options:
+        functions: true
+        classes: true
+        modules: false
+
+    max_file_length:
+      enabled: true
+      severity: "warning"
+      options:
+        max_lines: 500
+        exclude_comments: true
+        exclude_blank_lines: true

@@ -1,0 +1,80 @@
+# Security-Focused Team Configuration
+# Example configuration for teams prioritizing security
+
+version: "1.0"
+
+# Extend base configuration
+extends:
+  - "../.codereview.yaml"
+
+# Strict security settings
+severity_threshold: "info"
+fail_on_severity: "warning"
+
+# Override checker configurations for security focus
+checkers:
+  security:
+    enabled: true
+    severity_override: "error"  # All security issues are errors
+    rules:
+      hardcoded_secrets:
+        enabled: true
+        severity: "error"
+        options:
+          patterns:
+            - "password\\s*=\\s*['\"][^'\"]{8,}['\"]"
+            - "api[_-]?key\\s*=\\s*['\"][^'\"]{16,}['\"]"
+            - "secret\\s*=\\s*['\"][^'\"]{12,}['\"]"
+            - "token\\s*=\\s*['\"][^'\"]{20,}['\"]"
+            - "private[_-]?key\\s*=\\s*['\"][^'\"]+['\"]"
+
+      sql_injection_risk:
+        enabled: true
+        severity: "error"
+
+      xss_risk:
+        enabled: true
+        severity: "error"
+
+  # Disable style checks for security focus
+  style:
+    enabled: false
+
+  # Reduce complexity checking
+  complexity:
+    enabled: true
+    rules:
+      max_cyclomatic_complexity:
+        options:
+          threshold: 15  # More lenient for security-first code
+
+# Security-specific ignore patterns
+ignore_patterns:
+  - pattern: "test_*.py"
+    type: "glob"
+    description: "Skip security checks in test files"
+
+  - pattern: "mock_data/**"
+    type: "glob"
+    description: "Skip mock/sample data"
+
+# Security custom rules
+custom_rules:
+  security_standards:
+    no_print_passwords:
+      enabled: true
+      severity: "error"
+      pattern: "print.*password|print.*secret|print.*token"
+      message: "Never print sensitive information"
+
+    require_https:
+      enabled: true
+      severity: "warning"
+      pattern: "http://[^\\s\"']+[^\\s\"'.]"
+      message: "Use HTTPS instead of HTTP for external URLs"
+
+    no_weak_crypto:
+      enabled: true
+      severity: "error"
+      pattern: "md5|sha1|des\\b|rc4"
+      message: "Avoid weak cryptographic algorithms"

@@ -1,0 +1,12 @@
+{
+    "deployed_at": "2025-09-25T08:32:43Z",
+    "environment": "development",
+    "version": "unknown",
+    "branch": "unknown",
+    "deployer": "siavashghaffari",
+    "force_deploy": false,
+    "quality_metrics": {
+        "total_issues": 3,
+        "critical_issues": 1
+    }
+}
